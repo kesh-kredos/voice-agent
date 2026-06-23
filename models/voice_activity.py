@@ -3,7 +3,7 @@ import logging
 import torch
 from typing import Generator
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("VADClient")
 
 SAMPLE_RATE = 16000
 CHUNK_SIZE = 512
@@ -16,7 +16,7 @@ class VADClient:
         self._load_model()
 
     def _load_model(self):
-        logger.info("VADClient - LOADING SILERO VOICE ACTIVITY DETECTOR")
+        logger.info("Loading Silero VAD")
         self.model, self.utils = torch.hub.load(
             repo_or_dir='snakers4/silero-vad',
             model='silero_vad',
@@ -24,7 +24,7 @@ class VADClient:
             onnx=False,
         )
         self.model.eval()
-        logger.info("VADClient - SILERO VAD LOADED")
+        logger.info("Silero VAD loaded")
 
     def _chunk_to_tensor(self, chunk: bytes) -> torch.Tensor:
         audio_data = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
@@ -54,7 +54,7 @@ class VADClient:
 
                 if silence_count >= self.silence_chunks:
                     noise = np.concatenate(buffer)
-                    logger.debug(f"VADClient - End of speech — {len(noise)/SAMPLE_RATE:.2f}s")
+                    logger.debug(f"End of speech — {len(noise)/SAMPLE_RATE:.2f}s")
                     yield noise
                     buffer = []
                     silence_count = 0

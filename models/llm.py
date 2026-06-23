@@ -21,7 +21,7 @@ from openai import AsyncOpenAI
 from datetime import date
 import time
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("LLMClient")
 
 SYSTEM_PROMPT = """
 # Role & Objective
@@ -119,7 +119,7 @@ class LLMClient:
         self.max_tokens = max_tokens
         self.client = AsyncOpenAI(base_url=base_url, api_key="not-needed") # No API key needed for local endpoint
         et = time.perf_counter() - start
-        logger.info(f"LLMClient - Initialized with model: {self.model} in {et:.2f} seconds")
+        logger.info(f"Initialized with model: {self.model} in {et:.2f} seconds")
 
     
     async def stream(
@@ -144,7 +144,7 @@ class LLMClient:
             {'role': 'user', 'content': transcript}
         ]
 
-        logger.debug(f"LLMClient - Sending transcript to LLM: {transcript}")
+        logger.debug(f"Sending transcript to LLM: {transcript}")
         
         stream = await self.client.chat.completions.create(
             model=self.model,
@@ -162,9 +162,9 @@ class LLMClient:
                 yield delta
         
         text = "".join(response)
-        logger.debug(f"LLMClient - LLM responded with: {text}")
+        logger.debug(f"LLM responded with: {text}")
 
         for signal in EOC_SIGNALS:
             if signal in text:
-                logger.info(f"LLMClient - Detected end-of-call signal: {signal}")
+                logger.info(f"Detected end-of-call signal: {signal}")
                 break

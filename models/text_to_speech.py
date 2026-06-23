@@ -3,8 +3,9 @@ import logging
 import time
 from typing import AsyncGenerator
 from kokoro import KPipeline
+import asyncio
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("TTSClient")
 
 KOKORO_SAMPLE_RATE = 24000
 TWILIO_SAMPLE_RATE = 8000
@@ -23,75 +24,59 @@ class TTSClient:
     """
 
     def __init__(self, voice: str = "am_adam", lang_code: str = "a"):
-        logger.info(f"TTSClient - Initializing Kokoro TTS with voice: {voice}")
+        logger.info(f"Initializing Kokoro TTS with voice: {voice}")
         start = time.perf_counter()
         
         self.voice = voice
         self.pipeline = KPipeline(lang_code=lang_code)
         et = time.perf_counter() - start
-        logger.info(f"TTSClient - Kokoro TTS initialized in {et:.2f} seconds")
+        logger.info(f"Kokoro TTS initialized in {et:.2f} seconds")
 
     
-    def _synthesize_chunk(self, text: str) -> list[np.ndarray]:
-
-        if not text.strip():
-            return []
-
-        start = time.perf_counter()
-        chunks = []
-
-        generator = self.pipeline(text, voice=self.voice)
-        for i, (gs, ps, audio) in enumerate(generator):
-            logger.debug(f"TTSClient - Segment {i} | gs='{gs}' | ps='{ps}'")
-            chunks.append(audio)
-        
-        et = time.perf_counter() - start
-        total_duration = sum(len(c) for c in chunks) / KOKORO_SAMPLE_RATE
-        logger.debug(
-            f"TTSClient - Synthesized {total_duration:.2f}s of audio from"
-            f" {len(text)} chars in {et:.2f}ms"
-        )
-        
-        return chunks
-
     async def stream(
-            self, token_stream: AsyncGenerator[str, None]
-    ) -> AsyncGenerator[np.ndarray, None]:
+            self,
+            token_stream: AsyncGenerator[str, None]
+        ) -> AsyncGenerator[np.ndarray, None]:
 
         buff = ""
-
         async for token in token_stream:
             buff += token
-            if any(buffer.rstrip().endswith(char) for char in FLUSH_CHARS):
-                for audio in self._synthesize_chunk(buff):
-                    yield audio
-                buff = ""
+            if any(ch in buff for ch in FLUSH_CHARS):
+                sentences = self._split_on_flush(buff)
+                for sentence in sentences[:-1]:
+                    sentence = sentence.strip()
+                    if sentence:
+                        async for chunk in self._synthesize(sentence):
+                            yield chunk
+                buff = sentences[-1]
         
-        # Flush any remaining text in the buffer after the stream ends
         if buff.strip():
-            for audio in self._synthesize_chunk(buff):
-                yield audio
+            async for chunk in self._synthesize(buff.strip()):
+                yield chunk
 
-    def to_mulaw(self, audio: np.ndarray) -> bytes:
-        from scipy.signal import resample_poly
+    
+    async def _synthesize(self, text: str) -> AsyncGenerator[np.ndarray, None]:
 
-        downsampled = resample_poly(audio, up=1, down=3)
-        cliped = np.clip(downsampled, -1.0, 1.0)
-        pcm16 = (cliped * 32767).astype(np.int16)
+        loop = asyncio.get_event_loop()
 
-        return self._linear_to_mulaw(pcm16).tobytes()
+        def _run():
+            generator = self.pipeline(text, voice=self.voice)
+            chunks = []
+            for gs, ps, audio in generator:
+                chunks.append(audio)
+            
+            return chunks
+        
+        chunks = await loop.run_in_executor(None, _run)
+        for chunk in chunks:
+            yield chunk
     
     @staticmethod
-    def _linear_to_mulaw(pcm: np.ndarray) -> np.ndarray:
-    
-        BIAS = 33
-        pcm = pcm.astype(np.int32)
-        sign = np.where(pcm < 0, 0x80, 0x00)
-        pcm = np.abs(pcm)
-        pcm = np.clip(pcm, 0, 32635) + BIAS
-        exp = np.clip(np.floor(np.log2(pcm)).astype(np.int32) - 5, 0, 7)
-        mantissa = (pcm >> (exp + 1)) & 0x0F
+    def _split_on_flush(text: str) -> list[str]:
+        import re
+        parts = re.split(r'(?<=[.?!,;:])\s*', text)
+        return parts if parts else [text]
 
-        return (~(sign | (exp << 4) | mantissa)).astype(np.uint8)
     
 
+    

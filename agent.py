@@ -13,7 +13,7 @@ from models.llm import LLMClient, EOC_SIGNALS
 from models.speech_to_text import STTClient
 from utils.audio import mulaw_to_float32, float32_to_mulaw, pcm16_to_float32, float32_to_wav
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("Agent")
 
 SAMPLE_RATE = 16000
 CHUNK_SIZE = 512
@@ -27,7 +27,7 @@ class VoiceAgent:
             llm: LLMClient,
             tts: TTSClient,
             customer_ctx: dict,
-            mode: str = "browser"
+            mode: str = "twilio"
         ):
         self.vad = vad
         self.stt = stt
@@ -41,7 +41,7 @@ class VoiceAgent:
         self._call_ended: bool = False
         self.call_status: str | None = None
 
-        logger.info(f"Agent - New agent initialized for {customer_ctx.get("name", "TEST CUSTOMER")}")
+        logger.info(f"New agent initialized for {customer_ctx.get("name", "TEST CUSTOMER")}")
 
 
     def enqueue_audio(self, raw_bytes: bytes):
@@ -49,7 +49,7 @@ class VoiceAgent:
 
     async def run(self, send_audio_callback):
         logger.info(
-            f'Agent - New voice session started for {self.customer_ctx.get('customer_name', 'TEST CUSTOMER')}'
+            f'New voice session started for {self.customer_ctx.get('customer_name', 'TEST CUSTOMER')}'
             f'[mode={self.mode}]'
         )
 
@@ -133,13 +133,13 @@ class VoiceAgent:
             await send_audio(encoded)
         
         et = (time.perf_counter() - start) * 1000
-        logger.info(f'Agent - Outgoing message completed in {et:.0f}ms')
+        logger.info(f'Outgoing message completed in {et:.0f}ms')
         
         response = "".join(tokens)
         for sig in EOC_SIGNALS:
             if sig in response:
                 status = sig.split(":")[-1]
-                logger.info(f"Agent - end-of-call signal detected: {status}")
+                logger.info(f"End-of-call signal detected: {status}")
                 self.call_status = status
                 self._call_ended = True
                 return
@@ -177,7 +177,7 @@ class VoiceAgent:
         async for audio in self.tts.stream(self._as_token_stream(message)):
             await send_audio(self._audio_encode(audio))
         
-        logger.info("Agent - Escalation was detected")
+        logger.info("Escalation was detected")
     
     @staticmethod
     async def _as_token_stream(text: str) -> AsyncGenerator[str, None]:
