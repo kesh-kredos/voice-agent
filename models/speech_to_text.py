@@ -8,12 +8,12 @@ logger = logging.getLogger(__name__)
 
 MODEL_ID = 'openai/whisper-large-v3-turbo'
 
-class SpeechToText:
+class STTClient:
     def __init__(self, device: str = None, torch_dtype = None):
         self.device = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
         self.torch_dtype = torch_dtype or (torch.float16 if torch.cuda.is_available() else torch.float32)
 
-        logger.info(f"LOADING {MODEL_ID} ON {self.device} WITH {self.torch_dtype}")
+        logger.info(f"STTClient - Loading {MODEL_ID} on {self.device} w/ {self.torch_dtype}")
 
         model = AutoModelForSpeechSeq2Seq.from_pretrained(
             MODEL_ID,
@@ -34,7 +34,7 @@ class SpeechToText:
             device=self.device
         )
 
-        logger.info(f"{MODEL_ID} LOADED")
+        logger.info(f"STTClient - {MODEL_ID} loaded")
 
     
     def transcribe(self, audio: np.ndarray, lang: str = "english") -> str:
@@ -53,6 +53,6 @@ class SpeechToText:
 
         txt = res['text'].strip()
         elapsed = (time.perf_counter() - start) * 1000
-        logger.debug(f"STT -- Transcription took {elapsed:.2f}ms: {txt}")
+        logger.debug(f"STTClient - Transcription took {elapsed:.2f}ms: {txt}")
 
         return txt
