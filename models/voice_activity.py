@@ -60,3 +60,6 @@ class VADClient:
                     silence_count = 0
                     speaking = False
 
+    def is_speech(self, frame: np.ndarray) -> bool:
+        tensor = torch.from_numpy(frame.astype(np.float32))
+        return self.model(tensor, SAMPLE_RATE).item() >= self.threshold

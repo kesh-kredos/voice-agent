@@ -122,7 +122,7 @@ class LLMClient:
         logger.info(f"LLMClient - Initialized with model: {self.model} in {et:.2f} seconds")
 
     
-    async def stream_response(
+    async def stream(
             self,
             transcript: str,
             history: list[dict],
