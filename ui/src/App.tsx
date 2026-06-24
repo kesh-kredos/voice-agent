@@ -18,20 +18,21 @@ export default function App() {
   const [sessionInfo, setSessionInfo] = useState('');
   const [statusText, setStatusText] = useState('Not connected');
   const [barHeights, setBarHeights] = useState <number[]>(Array(NUM_BARS).fill(6));
+  const [agentOpened, setAgentOpened] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
-  const processorRef = useRef<AudioWorklet | null>(null);
+  const workletNodeRef = useRef<AudioWorkletNode | null>(null)
   const animFrameRef = useRef<number>(0);
   const agentQueueRef = useRef<ArrayBuffer[]>([]);
   const isPlayingRef = useRef(false);
-  const appStatRef = useRef<AppState>('idle');
+  const appStateRef = useRef<AppState>('idle');
   const msgIdRef = useRef(0);
   const transcriptRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {appStatRef.current = appState}, [appState]);
+  useEffect(() => {appStateRef.current = appState}, [appState]);
 
   useEffect(() => {
     if (transcriptRef.current) {
@@ -77,9 +78,10 @@ export default function App() {
   const playNextChunk = useCallback(async () => {
     if (!agentQueueRef.current.length){
       isPlayingRef.current = false;
-      if (appStatRef.current === 'speaking'){
+      if (appStateRef.current === 'speaking'){
         setAppState('connected');
         setStatusText('Connected to agent - hold mic to speak');
+        setAgentOpened(true);
       }
       return;
     }
@@ -128,7 +130,7 @@ export default function App() {
 
       ws.onopen = () => {
         setAppState('connected');
-        setStatusText('Connected to agent - hold mic to speak');
+        setStatusText('Connecting to agent - hold mic to speak');
         cancelAnimationFrame(animFrameRef.current);
         idlePulse();
       }
@@ -152,8 +154,10 @@ export default function App() {
 
       ws.onclose = () => {
         setAppState('idle');
-        setStatusText('Connection error - check server status');
+        setStatusText('Disconnected from agent');
         wsRef.current = null;
+        cancelAnimationFrame(animFrameRef.current);
+        idlePulse();
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Uknown error';
@@ -166,8 +170,7 @@ export default function App() {
     wsRef.current?.close();
   }, []);
 
-// add this ref at the top with the others
-const workletNodeRef = useRef<AudioWorkletNode | null>(null)
+
 
 const startListening = useCallback(async () => {
   if (!audioCtxRef.current) audioCtxRef.current = new AudioContext()
@@ -205,7 +208,7 @@ const startListening = useCallback(async () => {
   micAnalyse()
   setAppState('listening')
   setStatusText('Listening…')
-  }, [micAnalyse])
+  }, [micAnalyse]);
 
 const stopListening = useCallback(() => {
   workletNodeRef.current?.disconnect()
@@ -218,20 +221,20 @@ const stopListening = useCallback(() => {
   idlePulse()
   setAppState('connected')
   setStatusText('Connected — hold mic to speak')
-  }, [idlePulse])
+  }, [idlePulse]);
 
   const handleMicDown = useCallback((e: React.MouseEvent | React.TouchEvent) => {
     e.preventDefault();
-    if (appStatRef.current !== 'listening') startListening();
+    if (appStateRef.current !== 'listening') startListening();
   }, [startListening]);
 
   const handleMicUp = useCallback(() => {
-    if (appStatRef.current === 'listening') stopListening();
+    if (appStateRef.current === 'listening') stopListening();
   }, [stopListening]);
 
 
   const isConnected = appState === 'connected' || appState === 'listening' || appState === 'speaking';
-  const micDisabled = !isConnected;
+  const micDisabled = !isConnected || !agentOpened;
 
   const barColor = appState === 'listening' 
   ? '#C8A96E'
