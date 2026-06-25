@@ -56,7 +56,7 @@ async def lifespan(app: FastAPI):
     _stt = STTClient(device=os.getenv("WHISPER_DVICE", "cuda:0"))
     _llm = LLMClient(
         base_url=os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1"),
-        model=os.getenv("VLLM_MODEL", "meta-llama/Meta-Llama-3.2-1B-Instruct")
+        model=os.getenv("VLLM_MODEL", "meta-llama/Llama-3.2-1B-Instruct")
     )
     _tts = TTSClient(
         voice=os.getenv("KOKORO_VOICE", "am_adam"),
@@ -143,7 +143,7 @@ async def browser_stream(websocket: WebSocket, session_id: str):
     agent_task = asyncio.create_task(agent.run(send_audio))
 
     try:
-        async for raw_msg in websocket.iter.bytes():
+        async for raw_msg in websocket.iter_bytes():
             agent.enqueue_audio(raw_msg)
     
     except WebSocketDisconnect:

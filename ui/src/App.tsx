@@ -1,6 +1,6 @@
-import React, { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback } from 'react'
 
-const BASE_URL = window.location.origin;
+const BASE_URL = window.location.origin
 
 type AppState = 'idle' | 'connected' | 'listening' | 'speaking'
 
@@ -10,245 +10,277 @@ interface Message {
   text: string
 }
 
-const NUM_BARS = 12;
+const NUM_BARS = 12
 
 export default function App() {
-  const [appState, setAppState] = useState<AppState>('idle');
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [sessionInfo, setSessionInfo] = useState('');
-  const [statusText, setStatusText] = useState('Not connected');
-  const [barHeights, setBarHeights] = useState <number[]>(Array(NUM_BARS).fill(6));
-  const [agentOpened, setAgentOpened] = useState(false);
+  const [appState, setAppState] = useState<AppState>('idle')
+  const [messages, setMessages] = useState<Message[]>([])
+  const [sessionInfo, setSessionInfo] = useState('')
+  const [statusText, setStatusText] = useState('Not connected')
+  const [barHeights, setBarHeights] = useState<number[]>(Array(NUM_BARS).fill(6))
 
-  const wsRef = useRef<WebSocket | null>(null);
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null);
-  const micStreamRef = useRef<MediaStream | null>(null);
+  // ── Refs ──────────────────────────────────────────────────────────────────
+  const wsRef = useRef<WebSocket | null>(null)
+
+  const micCtxRef = useRef<AudioContext | null>(null)
+
+  const playCtxRef = useRef<AudioContext | null>(null)
+
+  const analyserRef = useRef<AnalyserNode | null>(null)
+  const micStreamRef = useRef<MediaStream | null>(null)
   const workletNodeRef = useRef<AudioWorkletNode | null>(null)
-  const animFrameRef = useRef<number>(0);
-  const agentQueueRef = useRef<ArrayBuffer[]>([]);
-  const isPlayingRef = useRef(false);
-  const appStateRef = useRef<AppState>('idle');
-  const msgIdRef = useRef(0);
-  const transcriptRef = useRef<HTMLDivElement>(null);
+  const animFrameRef = useRef<number>(0)
+  const agentQueueRef = useRef<ArrayBuffer[]>([])
+  const isPlayingRef = useRef(false)
+  // Tracks scheduled end time for gapless chunk-to-chunk playback
+  const nextStartRef = useRef(0)
+  const appStateRef = useRef<AppState>('idle')
+  const msgIdRef = useRef(0)
+  const transcriptRef = useRef<HTMLDivElement>(null)
 
-  useEffect(() => {appStateRef.current = appState}, [appState]);
+  // ── State sync ────────────────────────────────────────────────────────────
+
+  useEffect(() => { appStateRef.current = appState }, [appState])
 
   useEffect(() => {
     if (transcriptRef.current) {
-      transcriptRef.current.scrollTop = transcriptRef.current.scrollHeight;
+      transcriptRef.current.scrollTop = transcriptRef.current.scrollHeight
     }
-  }, [messages]);
+  }, [messages])
 
   const addMessage = useCallback((role: 'user' | 'agent', text: string) => {
-    setMessages(prev => [...prev, {id: msgIdRef.current++, role, text}])
-  }, []);
+    setMessages(prev => [...prev, { id: msgIdRef.current++, role, text }])
+  }, [])
 
+  // ── Waveform animation ────────────────────────────────────────────────────
 
   const idlePulse = useCallback(() => {
     const animate = () => {
-      const t = Date.now() / 1000;
-      setBarHeights(Array.from({ length: NUM_BARS}, (_, i) => 
-      6 + Math.sin(t * 1.2 + i * 0.6) * 3
-    ))
-    animFrameRef.current = requestAnimationFrame(animate);
+      const t = Date.now() / 1000
+      setBarHeights(Array.from({ length: NUM_BARS }, (_, i) =>
+        6 + Math.sin(t * 1.2 + i * 0.6) * 3
+      ))
+      animFrameRef.current = requestAnimationFrame(animate)
     }
-    animFrameRef.current = requestAnimationFrame(animate);
-  }, []);
+    animFrameRef.current = requestAnimationFrame(animate)
+  }, [])
 
   const micAnalyse = useCallback(() => {
     const animate = () => {
-      if (!analyserRef.current) return;
-      const data = new Uint8Array(analyserRef.current.frequencyBinCount);
-      analyserRef.current.getByteFrequencyData(data);
-      const step = Math.floor(data.length / NUM_BARS);
-      setBarHeights(Array.from({ length: NUM_BARS }, (_, i) => 
-      Math.max(6, (data[i * step] / 255) * 56)
-    ))
-    animFrameRef.current = requestAnimationFrame(animate);
+      if (!analyserRef.current) return
+      const data = new Uint8Array(analyserRef.current.frequencyBinCount)
+      analyserRef.current.getByteFrequencyData(data)
+      const step = Math.floor(data.length / NUM_BARS)
+      setBarHeights(Array.from({ length: NUM_BARS }, (_, i) =>
+        Math.max(6, (data[i * step] / 255) * 56)
+      ))
+      animFrameRef.current = requestAnimationFrame(animate)
     }
-    animFrameRef.current = requestAnimationFrame(animate);
-  }, []);
+    animFrameRef.current = requestAnimationFrame(animate)
+  }, [])
 
   useEffect(() => {
     idlePulse()
-    return () => cancelAnimationFrame(animFrameRef.current);
-  }, [idlePulse]);
+    return () => cancelAnimationFrame(animFrameRef.current)
+  }, [idlePulse])
 
-  const playNextChunk = useCallback(async () => {
-    if (!agentQueueRef.current.length){
-      isPlayingRef.current = false;
-      if (appStateRef.current === 'speaking'){
-        setAppState('connected');
-        setStatusText('Connected to agent - hold mic to speak');
-        setAgentOpened(true);
+  // ── Agent audio playback ──────────────────────────────────────────────────
+
+  const drainQueue = useCallback(async () => {
+    if (isPlayingRef.current) return
+    isPlayingRef.current = true
+
+    if (!playCtxRef.current) {
+      playCtxRef.current = new AudioContext()
+    }
+    const ctx = playCtxRef.current
+    if (ctx.state === 'suspended') await ctx.resume()
+
+    setAppState('speaking')
+    setStatusText('Agent speaking…')
+
+    while (agentQueueRef.current.length > 0) {
+      const wav = agentQueueRef.current.shift()!
+      let buf: AudioBuffer
+      try {
+        buf = await ctx.decodeAudioData(wav.slice(0))
+      } catch (e) {
+        console.error('decodeAudioData failed:', e)
+        continue
       }
-      return;
+      const src = ctx.createBufferSource()
+      src.buffer = buf
+      src.connect(ctx.destination)
+
+      const now = ctx.currentTime
+      const start = Math.max(now, nextStartRef.current)
+      src.start(start)
+      nextStartRef.current = start + buf.duration
     }
 
-    isPlayingRef.current = true;
-    setAppState('speaking');
-    setStatusText('Agent is speaking...');
-    const wav = agentQueueRef.current.shift()!;
-    try {
-      if (!audioCtxRef.current){
-         audioCtxRef.current = new AudioContext();
-      }
-      const buf = await audioCtxRef.current.decodeAudioData(wav.slice(0));
-      const src = audioCtxRef.current.createBufferSource();
-      src.buffer = buf;
-      src.connect(audioCtxRef.current.destination);
-      src.onended = () => playNextChunk();
-      src.start();
+    isPlayingRef.current = false
 
-    } catch {
-      playNextChunk();
+    if (appStateRef.current === 'speaking') {
+      setAppState('connected')
+      setStatusText('Connected — hold mic to speak')
     }
-    
-  }, []);
+  }, [])
+
+  // ── WebSocket connection ──────────────────────────────────────────────────
 
   const connectSession = useCallback(async () => {
     try {
-      setStatusText('Creating new session...');
+      setStatusText('Creating session…')
 
       const res = await fetch(`${BASE_URL}/browser-session`, {
         method: 'POST',
-        headers: {'Content-Type': 'application/json'},
+        headers: { 'Content-Type': 'application/json' },
         body: '{}'
-      });
-      if(!res.ok){
-        throw new Error(`Session failed with status: ${res.status}`);
-      }
-      const { session_id } = await res.json();
-      setSessionInfo(`Session created with ID: ${session_id.slice(0, 8)}...`);
+      })
+      if (!res.ok) throw new Error(`Session failed: ${res.status}`)
+      const { session_id } = await res.json()
+      setSessionInfo(`Session ${session_id.slice(0, 8)}…`)
 
       const ws = new WebSocket(
         `${BASE_URL.replace('http', 'ws')}/browser-stream/${session_id}`
-      );
-      ws.binaryType = 'arraybuffer';
-      wsRef.current = ws;
+      )
+      ws.binaryType = 'arraybuffer'
+      wsRef.current = ws
 
       ws.onopen = () => {
-        setAppState('connected');
-        setStatusText('Connecting to agent - hold mic to speak');
-        cancelAnimationFrame(animFrameRef.current);
-        idlePulse();
+        setAppState('connected')
+        setStatusText('Connected — hold mic to speak')
+        cancelAnimationFrame(animFrameRef.current)
+        idlePulse()
       }
 
       ws.onmessage = (e) => {
-        if (e.data instanceof ArrayBuffer){
-          agentQueueRef.current.push(e.data);
-          if (!isPlayingRef.current){
-            playNextChunk()
-          }
+        if (e.data instanceof ArrayBuffer) {
+          agentQueueRef.current.push(e.data)
+          void drainQueue()
         } else {
-          const evt = JSON.parse(e.data);
-          if (evt.type === 'transcript') addMessage('user', evt.text);
-          if (evt.type === 'agent_text') addMessage ('agent', evt.text);
-          if (evt.type == 'status') {
-            setAppState('idle');
-            setStatusText(`Call ended: ${evt.value}`);
+          const evt = JSON.parse(e.data as string)
+          if (evt.type === 'transcript') addMessage('user', evt.text)
+          if (evt.type === 'agent_text') addMessage('agent', evt.text)
+          if (evt.type === 'status') {
+            setAppState('idle')
+            setStatusText(`Call ended: ${evt.value}`)
           }
         }
       }
 
       ws.onclose = () => {
-        setAppState('idle');
-        setStatusText('Disconnected from agent');
-        wsRef.current = null;
-        cancelAnimationFrame(animFrameRef.current);
-        idlePulse();
+        setAppState('idle')
+        setStatusText('Disconnected')
+        wsRef.current = null
+        cancelAnimationFrame(animFrameRef.current)
+        idlePulse()
       }
+
+      ws.onerror = () => {
+        setAppState('idle')
+        setStatusText('Connection error — is the server running?')
+        wsRef.current = null
+      }
+
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Uknown error';
-      setAppState('idle');
-      setStatusText(`Error: ${msg}`);
+      const msg = err instanceof Error ? err.message : 'Unknown error'
+      setAppState('idle')
+      setStatusText(`Error: ${msg}`)
     }
-  }, [idlePulse, playNextChunk, addMessage]);
+  }, [idlePulse, drainQueue, addMessage])
 
   const disconnect = useCallback(() => {
-    wsRef.current?.close();
-  }, []);
+    wsRef.current?.close()
+  }, [])
 
+  // ── Mic capture ───────────────────────────────────────────────────────────
 
+  const startListening = useCallback(async () => {
 
-const startListening = useCallback(async () => {
-  if (!audioCtxRef.current) audioCtxRef.current = new AudioContext()
-  const ctx = audioCtxRef.current
-
-  micStreamRef.current = await navigator.mediaDevices.getUserMedia({
-    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }
-  })
-
-  await ctx.audioWorklet.addModule('/pcm-processor.js')
-
-  const src = ctx.createMediaStreamSource(micStreamRef.current)
-
-  analyserRef.current = ctx.createAnalyser()
-  analyserRef.current.fftSize = 256
-  src.connect(analyserRef.current)
-
-  workletNodeRef.current = new AudioWorkletNode(ctx, 'pcm-processor')
-  src.connect(workletNodeRef.current)
-
-  const ratio = ctx.sampleRate / 16000
-
-  workletNodeRef.current.port.onmessage = (e) => {
-    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
-    const input: Float32Array = e.data
-    const outLen = Math.floor(input.length / ratio)
-    const pcm16 = new Int16Array(outLen)
-    for (let i = 0; i < outLen; i++) {
-      pcm16[i] = Math.max(-32768, Math.min(32767, input[Math.floor(i * ratio)] * 32767))
+    if (!micCtxRef.current) {
+      micCtxRef.current = new AudioContext()
     }
-    wsRef.current.send(pcm16.buffer)
-  }
+    const ctx = micCtxRef.current
+    if (ctx.state === 'suspended') await ctx.resume()
 
-  cancelAnimationFrame(animFrameRef.current)
-  micAnalyse()
-  setAppState('listening')
-  setStatusText('Listening…')
-  }, [micAnalyse]);
+    micStreamRef.current = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }
+    })
 
-const stopListening = useCallback(() => {
-  workletNodeRef.current?.disconnect()
-  workletNodeRef.current = null
-  micStreamRef.current?.getTracks().forEach(t => t.stop())
-  micStreamRef.current = null
-  analyserRef.current?.disconnect()
-  analyserRef.current = null
-  cancelAnimationFrame(animFrameRef.current)
-  idlePulse()
-  setAppState('connected')
-  setStatusText('Connected — hold mic to speak')
-  }, [idlePulse]);
+    await ctx.audioWorklet.addModule('/pcm-processor.js')
+
+    const src = ctx.createMediaStreamSource(micStreamRef.current)
+
+    analyserRef.current = ctx.createAnalyser()
+    analyserRef.current.fftSize = 256
+    src.connect(analyserRef.current)
+
+    workletNodeRef.current = new AudioWorkletNode(ctx, 'pcm-processor')
+    src.connect(workletNodeRef.current)
+
+    const ratio = ctx.sampleRate / 16000
+
+    workletNodeRef.current.port.onmessage = (e) => {
+      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
+      const input: Float32Array = e.data
+      const outLen = Math.floor(input.length / ratio)
+      const pcm16 = new Int16Array(outLen)
+      for (let i = 0; i < outLen; i++) {
+        pcm16[i] = Math.max(-32768, Math.min(32767, input[Math.floor(i * ratio)] * 32767))
+      }
+      wsRef.current.send(pcm16.buffer)
+    }
+
+    cancelAnimationFrame(animFrameRef.current)
+    micAnalyse()
+    setAppState('listening')
+    setStatusText('Listening…')
+  }, [micAnalyse])
+
+  const stopListening = useCallback(() => {
+    workletNodeRef.current?.disconnect()
+    workletNodeRef.current = null
+    micStreamRef.current?.getTracks().forEach(t => t.stop())
+    micStreamRef.current = null
+    analyserRef.current?.disconnect()
+    analyserRef.current = null
+    cancelAnimationFrame(animFrameRef.current)
+    idlePulse()
+    setAppState('connected')
+    setStatusText('Connected — hold mic to speak')
+  }, [idlePulse])
+
+  // ── Mic button handlers ───────────────────────────────────────────────────
 
   const handleMicDown = useCallback((e: React.MouseEvent | React.TouchEvent) => {
-    e.preventDefault();
-    if (appStateRef.current !== 'listening') startListening();
-  }, [startListening]);
+    e.preventDefault()
+    if (appStateRef.current !== 'listening') startListening()
+  }, [startListening])
 
   const handleMicUp = useCallback(() => {
-    if (appStateRef.current === 'listening') stopListening();
-  }, [stopListening]);
+    if (appStateRef.current === 'listening') stopListening()
+  }, [stopListening])
 
+  // ── Derived style helpers ─────────────────────────────────────────────────
+  const isConnected = appState === 'connected' || appState === 'listening' || appState === 'speaking'
+  const micDisabled = !isConnected
 
-  const isConnected = appState === 'connected' || appState === 'listening' || appState === 'speaking';
-  const micDisabled = !isConnected || !agentOpened;
+  const barColor = appState === 'listening'
+    ? '#C8A96E'
+    : appState === 'speaking'
+    ? '#4F8EF7'
+    : 'rgba(255,255,255,0.15)'
 
-  const barColor = appState === 'listening' 
-  ? '#C8A96E'
-  : appState === 'speaking'
-  ? '#4F8EF7'
-  : 'rgba(255, 255, 255, 0.15)';
+  const dotColor = appState === 'listening'
+    ? '#C8A96E'
+    : appState === 'speaking'
+    ? '#4F8EF7'
+    : appState === 'connected'
+    ? '#4CAF7D'
+    : 'rgba(255,255,255,0.2)'
 
-  const dotColor = appState === 'listening' 
-  ? '#C8A96E'
-  : appState === 'speaking'
-  ? '#4F8EF7'
-  : appState === 'connected'
-  ? '#4CAF7D'
-  : 'rgba(255, 255, 255, 0.2)';
+  // ── Render ────────────────────────────────────────────────────────────────
   return (
     <div style={styles.shell}>
       <div style={styles.card}>
@@ -256,7 +288,7 @@ const stopListening = useCallback(() => {
         {/* Header */}
         <div style={styles.companyLabel}>Billing Agent Demo</div>
 
-        {/* Waveform */}
+        {/* Waveform — animates gold when listening, blue when agent speaking */}
         <div style={styles.waveformArea}>
           <div style={styles.waveform}>
             {barHeights.map((h, i) => (
@@ -282,7 +314,7 @@ const stopListening = useCallback(() => {
           </div>
         </div>
 
-        {/* Transcript */}
+        {/* Transcript — scrollable chat bubbles, user left / agent right */}
         <div style={styles.transcript} ref={transcriptRef}>
           {messages.length === 0 ? (
             <div style={styles.emptyMsg}>Connect to start a session</div>
@@ -305,7 +337,7 @@ const stopListening = useCallback(() => {
           )}
         </div>
 
-        {/* Controls */}
+        {/* Controls — mic hold-to-speak button + connect/disconnect button */}
         <div style={styles.controls}>
           <button
             style={{
@@ -345,6 +377,8 @@ const stopListening = useCallback(() => {
     </div>
   )
 }
+
+// ── Styles ────────────────────────────────────────────────────────────────────
 
 const styles: Record<string, React.CSSProperties> = {
   shell: {
@@ -474,37 +508,39 @@ const styles: Record<string, React.CSSProperties> = {
     alignItems: 'center',
     justifyContent: 'center',
     fontSize: 22,
-    color: 'rgba(255,255,255,0.55)',
-    transition: 'background 0.2s ease, border-color 0.2s ease, transform 0.1s ease',
+    color: 'rgba(255,255,255,0.6)',
+    transition: 'background 0.2s ease, border-color 0.2s ease, color 0.2s ease',
+    outline: 'none',
   },
   micBtnListening: {
-    background: 'rgba(200,169,110,0.12)',
-    borderColor: 'rgba(200,169,110,0.4)',
+    background: 'rgba(200,169,110,0.15)',
+    borderColor: 'rgba(200,169,110,0.5)',
     color: '#C8A96E',
   },
   micBtnSpeaking: {
-    background: 'rgba(79,142,247,0.1)',
-    borderColor: 'rgba(79,142,247,0.3)',
+    background: 'rgba(79,142,247,0.15)',
+    borderColor: 'rgba(79,142,247,0.4)',
     color: '#4F8EF7',
   },
   connectBtn: {
     width: '100%',
-    height: 44,
+    padding: '13px 0',
     borderRadius: 12,
     border: '0.5px solid rgba(255,255,255,0.1)',
-    background: 'rgba(255,255,255,0.06)',
+    background: 'rgba(255,255,255,0.05)',
     color: 'rgba(255,255,255,0.6)',
-    fontSize: 13,
+    fontSize: 14,
     fontWeight: 500,
-    letterSpacing: '0.03em',
+    letterSpacing: '0.02em',
     cursor: 'pointer',
+    transition: 'background 0.2s ease, color 0.2s ease',
+    outline: 'none',
     fontFamily: 'inherit',
-    transition: 'background 0.2s, color 0.2s',
   },
   connectBtnConnected: {
-    background: 'rgba(76,175,125,0.1)',
-    borderColor: 'rgba(76,175,125,0.25)',
-    color: '#4CAF7D',
+    background: 'rgba(255,80,80,0.08)',
+    borderColor: 'rgba(255,80,80,0.2)',
+    color: 'rgba(255,120,120,0.8)',
   },
   sessionInfo: {
     fontSize: 11,

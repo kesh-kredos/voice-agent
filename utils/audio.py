@@ -71,7 +71,9 @@ def pcm16_to_float32(pcm_bytes: bytes) -> np.ndarray:
     pcm16 = np.frombuffer(pcm_bytes, dtype=np.int16)
     return pcm16.astype(np.float32) / 32768.0
 
-def float32_to_wav(audio: np.ndarray) -> bytes:
+def float32_to_wav(audio) -> bytes:
+    if hasattr(audio, "detach"):
+        audio = audio.detach().cpu().numpy()
     pcm16 = (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16)
     return _build_wav(pcm16, sample_rate=24000)
 

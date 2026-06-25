@@ -7,7 +7,7 @@ Start the vLLM server before running this agent.
 Run this first:
 
     python -m vllm.entrypoints.openai.api_server \
-        --model meta-llama/Meta-Llama-3.2-1B-Instruct \
+        --model meta-llama/Llama-3.2-1B \
         --port 8000 \
         --max-model-len 4096
 
@@ -111,7 +111,7 @@ class LLMClient:
     def __init__(
             self, 
             base_url: str = "http://localhost:8000/v1", 
-            model: str = "meta-llama/Meta-Llama-3.2-1B-Instruct", 
+            model: str = "meta-llama/Llama-3.2-1B-Instruct", 
             max_tokens: int = 180
     ):
         start = time.perf_counter()
@@ -132,11 +132,15 @@ class LLMClient:
         Stream the LLM's response based on the current transcript, conversation history, and customer context.
         MUST include customer_name, today's date, account ID, balance, due_date, last_payment, and company if needed
         """
-        system_content = SYSTEM_PROMPT.format(
-            company=customer_ctx.get("company", "TEST COMPANY"),
-            customer=customer_ctx.get("customer_name", "John Doe"),
-            today_date=customer_ctx.get("today_date", date.today().strftime("%B %d, %Y"))
-        )
+        try:
+            system_content = SYSTEM_PROMPT.format(
+                company=customer_ctx.get("company", "TEST COMPANY"),
+                customer=customer_ctx.get("customer_name", "John Doe"),
+                today_date=customer_ctx.get("today_date", date.today().strftime("%B %d, %Y"))
+            )
+        except KeyError as e:
+            logger.error(f"SYSTEM_PROMPT format error — missing key: {e}")
+            return
 
         messages = [
             {'role': 'system', 'content': system_content},
@@ -144,14 +148,15 @@ class LLMClient:
             {'role': 'user', 'content': transcript}
         ]
 
-        logger.debug(f"Sending transcript to LLM: {transcript}")
+        logger.info(f"Sending transcript to LLM: {transcript}")
         
         stream = await self.client.chat.completions.create(
             model=self.model,
             messages=messages,
             stream=True,
             max_tokens=self.max_tokens,
-            temperature=0.3
+            temperature=0.3,
+            stop=["<|eot_id|>", "<|im_end|>", "<|start_header_id|>"]
         )
 
         response = []

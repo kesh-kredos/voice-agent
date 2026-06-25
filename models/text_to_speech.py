@@ -63,7 +63,9 @@ class TTSClient:
             generator = self.pipeline(text, voice=self.voice)
             chunks = []
             for gs, ps, audio in generator:
-                chunks.append(audio)
+                if hasattr(audio, "detach"):
+                    audio = audio.detach().cpu().numpy()
+                    chunks.append(audio)
             
             return chunks
         
