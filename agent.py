@@ -6,7 +6,8 @@ from typing import AsyncGenerator
 
 
 from models.voice_activity import VADClient
-from models.text_to_speech import TTSClient
+from models.text_to_speech_kokoro import TTSClient
+from models.text_to_speech_orpheus import TTSClient
 from models.llm import LLMClient, EOC_SIGNALS
 from models.speech_to_text import STTClient
 from utils.audio import mulaw_to_float32, float32_to_mulaw, pcm16_to_float32, float32_to_wav

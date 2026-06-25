@@ -27,7 +27,7 @@ from dotenv import load_dotenv
 from models.voice_activity import VADClient
 from models.speech_to_text import STTClient
 from models.llm import LLMClient
-from models.text_to_speech import TTSClient
+from models.text_to_speech_orpheus import TTSClient
 from agent import VoiceAgent
 from utils.audio import twilio_media_message
 
@@ -59,8 +59,11 @@ async def lifespan(app: FastAPI):
         model=os.getenv("VLLM_MODEL", "meta-llama/Llama-3.2-1B-Instruct")
     )
     _tts = TTSClient(
-        voice=os.getenv("KOKORO_VOICE", "am_adam"),
-        lang_code=os.getenv("KOKORO_LANG", 'a')
+        # voice=os.getenv("KOKORO_VOICE", "am_adam"),
+        # lang_code=os.getenv("KOKORO_LANG", 'a')
+        voice=os.getenv("ORPHEUS_VOICE", "tara"),
+        # model_name=os.getenv("ORPHEUS_MODEL", "canopylabs/orpheus-3b-0.1-ft"),
+        # gpu_memory_utilization=float(os.getenv("ORPHEUS_GPU_UTIL", "0.25")),
     )
 
     et = time.perf_counter() - start

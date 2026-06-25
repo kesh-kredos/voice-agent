@@ -5,7 +5,7 @@ from typing import AsyncGenerator
 from kokoro import KPipeline
 import asyncio
 
-logger = logging.getLogger("TTSClient")
+logger = logging.getLogger("Kokoro Client")
 
 KOKORO_SAMPLE_RATE = 24000
 TWILIO_SAMPLE_RATE = 8000
