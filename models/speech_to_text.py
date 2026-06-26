@@ -44,10 +44,7 @@ class STTClient:
             {'array': audio, 'sampling_rate': 16000},
             generate_kwargs={
                 'language': lang,
-                'num_beams': 1,
                 # 'condition_on_previous_tokens': False,
-                # "compression_ratio_threshold": 1.35,
-                # "no_speech_threshold": 0.6,
             }
         )
 

@@ -63,3 +63,9 @@ class VADClient:
     def is_speech(self, frame: np.ndarray) -> bool:
         tensor = torch.from_numpy(frame.astype(np.float32))
         return self.model(tensor, SAMPLE_RATE).item() >= self.threshold
+
+    def reset_states(self) -> None:
+        """Clear Silero internal LSTM state. Call after TTS so echo leakage
+        does not prime the model into a spurious speech onset."""
+        if hasattr(self.model, "reset_states"):
+            self.model.reset_states()

@@ -35,7 +35,7 @@ def twilio_media_message(audio: bytes, stream_sid: str) -> str:
         'event': 'media',
         'streamSid': stream_sid,
         'media': {
-            'payload': base64.b64fdencode(audio).decode('utf-8')
+            'payload': base64.b64encode(audio).decode('utf-8')
         }
     })
 
@@ -58,7 +58,7 @@ def float32_to_mulaw(audio: np.ndarray) -> bytes:
     return _linear_to_mulaw(pcm16).tobytes()
 
 def _mulaw_to_linear(mulaw: np.ndarray) -> np.ndarray:
-    mulaw = ~mulaw.astype(np.int32) & 0X80
+    mulaw = ~mulaw.astype(np.int32) & 0xFF
     exponent = (mulaw >> 4) & 0x07
     mantissa = mulaw & 0x0F
     linear = (mantissa << (exponent + 1)) + (0x21 << exponent) - 33
@@ -71,6 +71,11 @@ def pcm16_to_float32(pcm_bytes: bytes) -> np.ndarray:
     pcm16 = np.frombuffer(pcm_bytes, dtype=np.int16)
     return pcm16.astype(np.float32) / 32768.0
 
+def float32_to_pcm16le(audio: np.ndarray) -> bytes:
+    """Convert 24kHz float32 mono TTS audio to raw PCM16 little-endian bytes."""
+    pcm16 = (np.clip(audio, -1.0, 1.0) * 32767.0).astype('<i2')
+    return pcm16.tobytes()
+
 def float32_to_wav(audio) -> bytes:
     if hasattr(audio, "detach"):
         audio = audio.detach().cpu().numpy()
@@ -82,7 +87,7 @@ def _build_wav(pcm16: np.ndarray, sample_rate: int) -> bytes:
     num_channels = 1
     bits_per_sample = 16
     byte_rate = sample_rate * num_channels * bits_per_sample // 8
-    block_align = num_channels + bits_per_sample // 8
+    block_align = num_channels * bits_per_sample // 8
     data_size = num_samples * block_align
     chunk_size = 36 + data_size
 

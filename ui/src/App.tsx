@@ -12,6 +12,13 @@ interface Message {
 
 const NUM_BARS = 12
 
+// Energy gate for the mic feed. While push-to-talk is held we otherwise
+// forward every ~2.6ms chunk to the server; near-silence then accumulates
+// into VAD-flagged "utterances" that Whisper hallucinates (e.g. "Thank
+// you."). Values are in PCM16 units where full-scale = 32767.
+const GATE_RMS_THRESHOLD = 200   // ~-44 dBFS; ~2x the observed noise floor
+const GATE_HANGOVER_MS = 300     // bridge inter-word pauses / soft onsets
+
 export default function App() {
   const [appState, setAppState] = useState<AppState>('idle')
   const [messages, setMessages] = useState<Message[]>([])
@@ -30,17 +37,31 @@ export default function App() {
   const micStreamRef = useRef<MediaStream | null>(null)
   const workletNodeRef = useRef<AudioWorkletNode | null>(null)
   const animFrameRef = useRef<number>(0)
-  const agentQueueRef = useRef<ArrayBuffer[]>([])
-  const isPlayingRef = useRef(false)
-  // Tracks scheduled end time for gapless chunk-to-chunk playback
-  const nextStartRef = useRef(0)
+  const playbackNodeRef = useRef<AudioWorkletNode | null>(null)
+  const playInitRef = useRef<Promise<void> | null>(null)
+
+  // Monotonic playback epoch. Stamped onto every 'samples' message and echoed
+  // back by the worklet in 'ended', so a drain notification queued from a
+  // previous utterance can't flip the UI to 'connected' after newer samples
+  // have already been posted. Bumped in resetPlayback to invalidate it.
+  const playbackEpochRef = useRef(0)
+  const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null)
+  const micPressedRef = useRef(false)
+  const connectingRef = useRef(false)
+  const listeningStartRef = useRef(false)
   const appStateRef = useRef<AppState>('idle')
   const msgIdRef = useRef(0)
   const transcriptRef = useRef<HTMLDivElement>(null)
 
   // ── State sync ────────────────────────────────────────────────────────────
 
-  useEffect(() => { appStateRef.current = appState }, [appState])
+  // Keep the ref in lock-step with state so event handlers that fire between
+  // the setState call and the next render (e.g. a quick tap/release on the mic
+  // button) see the latest value immediately.
+  const setAppStateAndRef = useCallback((s: AppState) => {
+    appStateRef.current = s
+    setAppState(s)
+  }, [])
 
   useEffect(() => {
     if (transcriptRef.current) {
@@ -86,50 +107,153 @@ export default function App() {
 
   // ── Agent audio playback ──────────────────────────────────────────────────
 
-  const drainQueue = useCallback(async () => {
-    if (isPlayingRef.current) return
-    isPlayingRef.current = true
-
+  // Create + unlock the playback AudioContext. MUST be called from a user
+  // gesture (the Connect click). Chrome's autoplay policy otherwise leaves the
+  // context 'suspended', which freezes currentTime at 0 and the worklet never
+  // renders. We also load the playback AudioWorklet module here so the node
+  // is ready the moment the first binary frame arrives.
+  const ensurePlayCtx = useCallback(async () => {
     if (!playCtxRef.current) {
-      playCtxRef.current = new AudioContext()
+      playCtxRef.current = new AudioContext({ latencyHint: 'interactive' })
     }
     const ctx = playCtxRef.current
     if (ctx.state === 'suspended') await ctx.resume()
 
-    setAppState('speaking')
-    setStatusText('Agent speaking…')
-
-    while (agentQueueRef.current.length > 0) {
-      const wav = agentQueueRef.current.shift()!
-      let buf: AudioBuffer
-      try {
-        buf = await ctx.decodeAudioData(wav.slice(0))
-      } catch (e) {
-        console.error('decodeAudioData failed:', e)
-        continue
+    if (!playbackNodeRef.current) {
+      // Serialize worklet creation: concurrent callers await the same promise
+      // so rapid clicks can't spawn orphaned AudioWorkletNodes.
+      if (!playInitRef.current) {
+        playInitRef.current = (async () => {
+          await ctx.audioWorklet.addModule('/playback-processor.js')
+          const node = new AudioWorkletNode(ctx, 'playback-processor', {
+            processorOptions: { prebufferSec: 0.15 },
+            outputChannelCount: [1]
+          })
+          node.connect(ctx.destination)
+          // The worklet posts 'ended' when its ring buffer drains to empty
+          // after playback — flip back to 'connected' then, instead of on a
+          // fixed timer that fires before the tail audio finishes.
+          node.port.onmessage = (e) => {
+            const msg = e.data
+            // Reject stale 'ended' from a prior drain: the worklet stamps it
+            // with the epoch of the samples that were playing. If newer samples
+            // have since been posted the epoch won't match, so we don't flip
+            // to 'connected' while the next utterance is starting.
+            if (msg && msg.type === 'ended' && appStateRef.current === 'speaking' && msg.epoch === playbackEpochRef.current) {
+              setAppStateAndRef('connected')
+              setStatusText('Connected — hold mic to speak')
+            }
+          }
+          playbackNodeRef.current = node
+        })().catch((err) => {
+          playInitRef.current = null
+          throw err
+        })
       }
-      const src = ctx.createBufferSource()
-      src.buffer = buf
-      src.connect(ctx.destination)
-
-      const now = ctx.currentTime
-      const start = Math.max(now, nextStartRef.current)
-      src.start(start)
-      nextStartRef.current = start + buf.duration
+      await playInitRef.current
     }
 
-    isPlayingRef.current = false
+    // Play a silent buffer to fully unlock output on the gesture.
+    const silent = ctx.createBuffer(1, 1, ctx.sampleRate)
+    const s = ctx.createBufferSource()
+    s.buffer = silent
+    s.connect(ctx.destination)
+    s.start(0)
+    return ctx
+  }, [setAppStateAndRef])
 
-    if (appStateRef.current === 'speaking') {
-      setAppState('connected')
-      setStatusText('Connected — hold mic to speak')
-    }
+  // Clear the worklet's ring buffer. Called on disconnect / error so stale
+  // audio from a previous session never leaks into the next one.
+  const resetPlayback = useCallback(() => {
+    // Bump the epoch so any 'ended' still queued from before the reset can't
+    // match the current epoch and flip the UI after a disconnect/reconnect.
+    playbackEpochRef.current++
+    playbackNodeRef.current?.port.postMessage({ type: 'clear' })
   }, [])
+
+  // Release every mic-capture resource (worklet, MediaStream tracks,
+  // analyser) and restart the idle waveform. Shared by stopListening and
+  // every session-teardown path so a mid-listening disconnect can't leak
+  // the microphone or its animation frame.
+  const teardownMic = useCallback(() => {
+    workletNodeRef.current?.disconnect()
+    workletNodeRef.current = null
+    micSourceRef.current?.disconnect()
+    micSourceRef.current = null
+    micStreamRef.current?.getTracks().forEach(t => t.stop())
+    micStreamRef.current = null
+    analyserRef.current?.disconnect()
+    analyserRef.current = null
+    cancelAnimationFrame(animFrameRef.current)
+    idlePulse()
+  }, [idlePulse])
+
+  // Parse a raw PCM16LE 24 kHz binary frame, convert to float32, resample to
+  // the playback context's sample rate if needed, and push into the worklet's
+  // ring buffer.
+  const handleBinaryFrame = useCallback((data: ArrayBuffer) => {
+    if (!wsRef.current) return
+    const node = playbackNodeRef.current
+    const ctx = playCtxRef.current
+    if (!node || !ctx) return
+
+    // Decode strictly as little-endian PCM16 — Int16Array would silently
+    // mis-decode on big-endian hosts.
+    const view = new DataView(data)
+    const numSamples = data.byteLength >> 1
+    if (numSamples === 0) return
+
+    const float32 = new Float32Array(numSamples)
+    for (let i = 0; i < numSamples; i++) {
+      float32[i] = view.getInt16(i * 2, true) / 32768
+    }
+
+    // Linear-interpolation resampler from 24 kHz → ctx.sampleRate.
+    const srcRate = 24000
+    const dstRate = ctx.sampleRate
+    let samples: Float32Array
+    if (srcRate === dstRate) {
+      samples = float32
+    } else {
+      const ratio = dstRate / srcRate
+      const outLen = Math.floor(float32.length * ratio)
+      samples = new Float32Array(outLen)
+      for (let i = 0; i < outLen; i++) {
+        const srcIdx = i / ratio
+        const idx0 = Math.floor(srcIdx)
+        const idx1 = Math.min(idx0 + 1, float32.length - 1)
+        const frac = srcIdx - idx0
+        samples[i] = float32[idx0] * (1 - frac) + float32[idx1] * frac
+      }
+    }
+
+    // Stamp this chunk with a fresh playback epoch; the worklet echoes it back
+    // on 'ended' so we can tell a stale drain from the current one.
+    const epoch = ++playbackEpochRef.current
+    node.port.postMessage({ type: 'samples', data: samples, epoch }, [samples.buffer])
+
+    // Mark agent as speaking; the worklet posts 'ended' when its buffer
+    // drains, which flips us back to 'connected'.
+    if (appStateRef.current !== 'speaking') {
+      setAppStateAndRef('speaking')
+      setStatusText('Agent speaking…')
+    }
+  }, [setAppStateAndRef])
 
   // ── WebSocket connection ──────────────────────────────────────────────────
 
   const connectSession = useCallback(async () => {
+    // Guard against re-entrant clicks while the session fetch / socket
+    // handshake is in flight — otherwise each click leaks a stale audio
+    // context and an orphan WebSocket.
+    if (connectingRef.current) return
+    if (wsRef.current) return
+    connectingRef.current = true
     try {
+      // Unlock audio output now, while we're still inside the click gesture,
+      // so the agent's opening line plays as soon as it arrives.
+      await ensurePlayCtx()
+
       setStatusText('Creating session…')
 
       const res = await fetch(`${BASE_URL}/browser-session`, {
@@ -148,7 +272,7 @@ export default function App() {
       wsRef.current = ws
 
       ws.onopen = () => {
-        setAppState('connected')
+        setAppStateAndRef('connected')
         setStatusText('Connected — hold mic to speak')
         cancelAnimationFrame(animFrameRef.current)
         idlePulse()
@@ -156,47 +280,78 @@ export default function App() {
 
       ws.onmessage = (e) => {
         if (e.data instanceof ArrayBuffer) {
-          agentQueueRef.current.push(e.data)
-          void drainQueue()
+          handleBinaryFrame(e.data)
         } else {
           const evt = JSON.parse(e.data as string)
           if (evt.type === 'transcript') addMessage('user', evt.text)
           if (evt.type === 'agent_text') addMessage('agent', evt.text)
           if (evt.type === 'status') {
-            setAppState('idle')
+            if (wsRef.current === ws) {
+              wsRef.current = null
+              ws.onopen = null
+              ws.onmessage = null
+              ws.onclose = null
+              ws.onerror = null
+              resetPlayback()
+              teardownMic()
+              ws.close()
+            }
+            setAppStateAndRef('idle')
             setStatusText(`Call ended: ${evt.value}`)
           }
         }
       }
 
       ws.onclose = () => {
-        setAppState('idle')
-        setStatusText('Disconnected')
+        if (wsRef.current !== ws) return
         wsRef.current = null
-        cancelAnimationFrame(animFrameRef.current)
-        idlePulse()
+        resetPlayback()
+        teardownMic()
+        setAppStateAndRef('idle')
+        setStatusText('Disconnected')
       }
 
       ws.onerror = () => {
-        setAppState('idle')
-        setStatusText('Connection error — is the server running?')
+        if (wsRef.current !== ws) return
         wsRef.current = null
+        resetPlayback()
+        teardownMic()
+        setAppStateAndRef('idle')
+        setStatusText('Connection error — is the server running?')
       }
 
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Unknown error'
-      setAppState('idle')
+      setAppStateAndRef('idle')
       setStatusText(`Error: ${msg}`)
+    } finally {
+      connectingRef.current = false
     }
-  }, [idlePulse, drainQueue, addMessage])
+  }, [idlePulse, handleBinaryFrame, addMessage, ensurePlayCtx, resetPlayback, teardownMic, setAppStateAndRef])
 
   const disconnect = useCallback(() => {
-    wsRef.current?.close()
-  }, [])
+    const ws = wsRef.current
+    if (!ws) return
+    wsRef.current = null
+    // Detach handlers before close so any frames the browser already queued
+    // are discarded rather than processed into playback after teardown.
+    ws.onopen = null
+    ws.onmessage = null
+    ws.onclose = null
+    ws.onerror = null
+    resetPlayback()
+    teardownMic()
+    setAppStateAndRef('idle')
+    setStatusText('Disconnected')
+    ws.close()
+  }, [resetPlayback, teardownMic, setAppStateAndRef])
 
   // ── Mic capture ───────────────────────────────────────────────────────────
 
   const startListening = useCallback(async () => {
+    if (listeningStartRef.current) return
+    listeningStartRef.current = true
+    try {
 
     if (!micCtxRef.current) {
       micCtxRef.current = new AudioContext()
@@ -211,6 +366,7 @@ export default function App() {
     await ctx.audioWorklet.addModule('/pcm-processor.js')
 
     const src = ctx.createMediaStreamSource(micStreamRef.current)
+    micSourceRef.current = src
 
     analyserRef.current = ctx.createAnalyser()
     analyserRef.current.fftSize = 256
@@ -221,44 +377,104 @@ export default function App() {
 
     const ratio = ctx.sampleRate / 16000
 
+    // Per-listening hangover deadline for the energy gate. Held in this
+    // closure so it resets each time the mic graph is rebuilt.
+    let gateHangoverUntil = 0
+
     workletNodeRef.current.port.onmessage = (e) => {
       if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
       const input: Float32Array = e.data
+      if (!input || input.length === 0) return
       const outLen = Math.floor(input.length / ratio)
       const pcm16 = new Int16Array(outLen)
+      let sumSq = 0
       for (let i = 0; i < outLen; i++) {
-        pcm16[i] = Math.max(-32768, Math.min(32767, input[Math.floor(i * ratio)] * 32767))
+        // Box-average the source samples spanning this output sample. Cheap
+        // anti-alias filter so 48k→16k decimation doesn't garble the mic feed
+        // and STT can reliably pick up the user turn after turn.
+        const start = Math.floor(i * ratio)
+        const end = Math.min(input.length, Math.floor((i + 1) * ratio))
+        let sum = 0
+        let n = 0
+        for (let j = start; j < end; j++) { sum += input[j]; n++ }
+        const s = n > 0 ? sum / n : input[start]
+        const v = Math.max(-32768, Math.min(32767, s * 32767))
+        pcm16[i] = v
+        sumSq += v * v
+      }
+      // Energy gate: drop near-silence/noise-floor chunks so they can't
+      // accumulate into hallucinated utterances server-side. A short hangover
+      // keeps sending after speech ends so inter-word pauses and soft onsets
+      // aren't chopped.
+      const rms = outLen > 0 ? Math.sqrt(sumSq / outLen) : 0
+      const now = performance.now()
+      if (rms >= GATE_RMS_THRESHOLD) {
+        gateHangoverUntil = now + GATE_HANGOVER_MS
+      } else if (now >= gateHangoverUntil) {
+        return
       }
       wsRef.current.send(pcm16.buffer)
     }
 
+    // If the user released the mic button while async setup was in flight,
+    // tear the graph back down immediately so the mic never becomes active
+    // on a button that's no longer held.
+    if (!micPressedRef.current) {
+      teardownMic()
+      return
+    }
+
+    // If the websocket died while async mic setup was in flight, don't
+    // transition to 'listening' — fall back to idle/disconnected cleanup.
+    if (!wsRef.current) {
+      teardownMic()
+      setAppStateAndRef('idle')
+      setStatusText('Disconnected')
+      return
+    }
+
     cancelAnimationFrame(animFrameRef.current)
     micAnalyse()
-    setAppState('listening')
+    setAppStateAndRef('listening')
     setStatusText('Listening…')
-  }, [micAnalyse])
+
+    } catch (err: unknown) {
+      teardownMic()
+      const msg = err instanceof Error ? err.message : 'Unknown error'
+      if (!wsRef.current) {
+        setAppStateAndRef('idle')
+        setStatusText('Disconnected')
+      } else {
+        setAppStateAndRef('connected')
+        setStatusText(`Mic error: ${msg}`)
+      }
+    } finally {
+      listeningStartRef.current = false
+    }
+  }, [micAnalyse, teardownMic, setAppStateAndRef])
 
   const stopListening = useCallback(() => {
-    workletNodeRef.current?.disconnect()
-    workletNodeRef.current = null
-    micStreamRef.current?.getTracks().forEach(t => t.stop())
-    micStreamRef.current = null
-    analyserRef.current?.disconnect()
-    analyserRef.current = null
-    cancelAnimationFrame(animFrameRef.current)
-    idlePulse()
-    setAppState('connected')
+    // Send an explicit end-of-turn signal before tearing down the mic so
+    // the server can finalize the utterance immediately — the RMS gate
+    // suppresses the trailing silence VAD needs to do this on its own.
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'end_of_turn' }))
+    }
+    teardownMic()
+    setAppStateAndRef('connected')
     setStatusText('Connected — hold mic to speak')
-  }, [idlePulse])
+  }, [teardownMic, setAppStateAndRef])
 
   // ── Mic button handlers ───────────────────────────────────────────────────
 
   const handleMicDown = useCallback((e: React.MouseEvent | React.TouchEvent) => {
     e.preventDefault()
+    micPressedRef.current = true
     if (appStateRef.current !== 'listening') startListening()
   }, [startListening])
 
   const handleMicUp = useCallback(() => {
+    micPressedRef.current = false
     if (appStateRef.current === 'listening') stopListening()
   }, [stopListening])
 
@@ -351,8 +567,10 @@ export default function App() {
             disabled={micDisabled}
             onMouseDown={handleMicDown}
             onMouseUp={handleMicUp}
+            onMouseLeave={handleMicUp}
             onTouchStart={handleMicDown}
             onTouchEnd={handleMicUp}
+            onTouchCancel={handleMicUp}
             title="Hold to speak"
           >
             <i className="ti ti-microphone" aria-hidden="true" />
